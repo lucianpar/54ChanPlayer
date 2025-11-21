@@ -16,7 +16,6 @@ al_ext/
 54ChanPlayer/*.a
 54ChanPlayer/*.so
 54ChanPlayer/*.dylib
-54ChanPlayer/sourceAudio/
 
 # Audio files
 *.wav
