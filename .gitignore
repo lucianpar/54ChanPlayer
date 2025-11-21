@@ -1,5 +1,33 @@
-build
-**/build
+# Ignore everything in the root
+/*
 
-bin
-**/bin
+# Except the 54ChanPlayer folder and gitignore itself
+!.gitignore
+!54ChanPlayer/
+
+# Ignore all allolib and al_ext changes
+allolib/
+al_ext/
+
+# But ignore these inside 54ChanPlayer
+54ChanPlayer/build/
+54ChanPlayer/bin/
+54ChanPlayer/*.o
+54ChanPlayer/*.a
+54ChanPlayer/*.so
+54ChanPlayer/*.dylib
+54ChanPlayer/sourceAudio/
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+*.aiff
+*.aif
+*.ogg
+*.m4a
+
+# System files
+.DS_Store
+.vscode/
+.idea/
