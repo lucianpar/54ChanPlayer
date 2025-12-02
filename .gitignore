@@ -1,22 +1,3 @@
-# Ignore everything in the root
-/*
-
-# Except the 54ChanPlayer folder and gitignore itself
-!.gitignore
-!54ChanPlayer/
-
-# Ignore all allolib and al_ext changes
-allolib/
-al_ext/
-
-# But ignore these inside 54ChanPlayer
-54ChanPlayer/build/
-54ChanPlayer/bin/
-54ChanPlayer/*.o
-54ChanPlayer/*.a
-54ChanPlayer/*.so
-54ChanPlayer/*.dylib
-
 # Audio files
 *.wav
 *.mp3
@@ -26,7 +7,37 @@ al_ext/
 *.ogg
 *.m4a
 
-# System files
-.DS_Store
+# Build artifacts
+build/
+bin/
+*.o
+*.a
+*.so
+*.dylib
+*.dll  
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# IDE and editor files
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compiled binaries
+mainplayer
+*.out
+*.app
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
