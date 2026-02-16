@@ -27,6 +27,7 @@ enum BufferState { EMPTY, LOADING, READY, PLAYING };
 
 struct adm_player {
   gam::SoundFile soundFile;
+  std::mutex soundFileMutex;  // Mutex for thread-safe access to soundFile
   std::atomic<uint64_t> frameCounter = {0};
   std::vector<float> buffer;
 
@@ -152,8 +153,16 @@ struct adm_player {
       
       // Load first chunk into buffer A synchronously
       loadChunkIntoBuffer(0, bufferA, stateA, chunkStartA);
-      activeBufferIndex.store(0);
-      stateA.store(PLAYING);
+      
+      // Verify the buffer was loaded correctly
+      if (stateA.load() == READY && bufferA.size() > 0) {
+        activeBufferIndex.store(0);
+        stateA.store(PLAYING);
+        std::cout << "  Successfully initialized buffer A with " << bufferA.size() << " samples" << std::endl;
+      } else {
+        std::cerr << "  ERROR: Failed to load initial buffer!" << std::endl;
+        streamingMode = false;  // Fall back to non-streaming
+      }
       
       std::cout << "  Streaming mode enabled - loaded first chunk into double buffer" << std::endl;
     }
@@ -217,6 +226,8 @@ struct adm_player {
     // Initialize states
     stateA.store(EMPTY);
     stateB.store(EMPTY);
+    chunkStartA.store(-1);
+    chunkStartB.store(-1);
     activeBufferIndex.store(-1);  // No active buffer initially
     
     // Start loader thread
@@ -266,17 +277,32 @@ struct adm_player {
       uint64_t actualChunkSize = getChunkSize(chunkStart);
       targetBuffer.resize(actualChunkSize * numChannels);
       
-      soundFile.seek(chunkStart, SEEK_SET);
-      int framesRead = soundFile.read(&targetBuffer[0], actualChunkSize);
+      uint64_t framesRead = 0;
+      {
+        std::lock_guard<std::mutex> lock(soundFileMutex);
+        soundFile.seek(chunkStart, SEEK_SET);
+        
+        uint64_t readBlockSize = 512;
+        while (framesRead < actualChunkSize) {
+          uint64_t framesToRead = std::min(actualChunkSize - framesRead, readBlockSize);
+          soundFile.read(&targetBuffer[framesRead * numChannels], framesToRead);
+          uint64_t actuallyRead = soundFile.frames();
+          framesRead += actuallyRead;
+          if (actuallyRead < framesToRead) break;  // End of file
+        }
+        
+        // Fill remaining with silence
+        std::fill(targetBuffer.begin() + framesRead * numChannels, targetBuffer.end(), 0.0f);
+      }
       
-      if (framesRead == (int)actualChunkSize) {
+      if (framesRead == actualChunkSize) {
         chunkStartVar.store(chunkStart);
         state.store(READY);
         std::cout << "Loaded chunk: frames " << chunkStart << " to " << (chunkStart + actualChunkSize - 1)
                   << " (" << actualChunkSize << " frames) into buffer" << std::endl;
       } else {
         state.store(EMPTY);
-        std::cerr << "Warning: Failed to load chunk at " << chunkStart << std::endl;
+        std::cerr << "Warning: Failed to load chunk at " << chunkStart << ", read " << framesRead << " of " << actualChunkSize << " frames" << std::endl;
       }
     } catch (const std::exception& e) {
       state.store(EMPTY);
@@ -316,17 +342,38 @@ struct adm_player {
   }
   
   bool trySwitchToBufferWithChunk(uint64_t chunkStart) {
+    std::cout << "Trying to switch to chunk " << chunkStart << std::endl;
+    std::cout << "Buffer A: state=" << stateA.load() << ", chunkStart=" << chunkStartA.load() 
+              << ", size=" << bufferA.size() << std::endl;
+    std::cout << "Buffer B: state=" << stateB.load() << ", chunkStart=" << chunkStartB.load() 
+              << ", size=" << bufferB.size() << std::endl;
+    
     if (stateA.load() == READY && chunkStartA.load() == chunkStart) {
-      activeBufferIndex.store(0);
-      stateA.store(PLAYING);
-      if (activeBufferIndex.load() == 1) stateB.store(EMPTY);  // Mark old buffer as empty
-      return true;
+      // Additional check: ensure buffer has data
+      if (bufferA.size() > 0) {
+        // Mark old buffer as empty before switching
+        int oldActive = activeBufferIndex.load();
+        if (oldActive == 1) stateB.store(EMPTY);
+        
+        activeBufferIndex.store(0);
+        stateA.store(PLAYING);
+        std::cout << "Switched to buffer A" << std::endl;
+        return true;
+      }
     } else if (stateB.load() == READY && chunkStartB.load() == chunkStart) {
-      activeBufferIndex.store(1);
-      stateB.store(PLAYING);
-      if (activeBufferIndex.load() == 0) stateA.store(EMPTY);  // Mark old buffer as empty
-      return true;
+      // Additional check: ensure buffer has data
+      if (bufferB.size() > 0) {
+        // Mark old buffer as empty before switching
+        int oldActive = activeBufferIndex.load();
+        if (oldActive == 0) stateA.store(EMPTY);
+        
+        activeBufferIndex.store(1);
+        stateB.store(PLAYING);
+        std::cout << "Switched to buffer B" << std::endl;
+        return true;
+      }
     }
+    std::cout << "No suitable buffer found or buffer empty" << std::endl;
     return false;
   }
   
@@ -345,8 +392,25 @@ struct adm_player {
   
   void performDirectRead(uint64_t chunkStart, uint64_t numFrames) {
     // Temporary direct read (slower but prevents dropout)
-    soundFile.seek(chunkStart, SEEK_SET);
-    soundFile.read(buffer.data(), numFrames);
+    uint64_t startFrame = chunkStart;
+    uint64_t maxFrame = soundFile.frames();
+    uint64_t endFrame = std::min(startFrame + numFrames, maxFrame);
+    uint64_t actualFrames = endFrame - startFrame;
+    
+    int framesRead = 0;
+    {
+      std::lock_guard<std::mutex> lock(soundFileMutex);
+      soundFile.seek(startFrame, SEEK_SET);
+      framesRead = soundFile.read(buffer.data(), actualFrames);
+    }
+    
+    std::cout << "Direct read: requested " << numFrames << " frames from " << chunkStart 
+              << ", read " << framesRead << " frames" << std::endl;
+    
+    // If we read fewer frames than requested, fill the rest with silence
+    if (framesRead < (int)numFrames) {
+      std::fill(buffer.begin() + framesRead * numChannels, buffer.end(), 0.0f);
+    }
   }
 
   void onAnimate(double dt) {
@@ -356,10 +420,12 @@ struct adm_player {
     uint64_t currentChunk = (currentFrame / chunkSize) * chunkSize;
     float progressThroughChunk = (float)(currentFrame % chunkSize) / chunkSize;
     
-    // Trigger loading at 75% through current chunk
-    if (progressThroughChunk > 0.75f) {
+    // Trigger loading at 50% through current chunk
+    if (progressThroughChunk > 0.5f) {
       uint64_t nextChunk = getNextChunkStart(currentChunk);
       if (nextChunk != UINT64_MAX) {
+        std::cout << "Animate: Triggering load of chunk " << nextChunk 
+                  << " (progress: " << progressThroughChunk << ")" << std::endl;
         requestLoadIntoInactiveBuffer(nextChunk);
       }
     }
@@ -635,23 +701,58 @@ struct adm_player {
     // Double buffering logic
     float* frames = nullptr;
     if (streamingMode) {
-      uint64_t requiredChunkStart = (frameCounter.load() / chunkSize) * chunkSize;
+      uint64_t currentFrame = frameCounter.load();
+      uint64_t requiredChunkStart = (currentFrame / chunkSize) * chunkSize;
+      uint64_t activeChunkStart = getActiveBufferChunkStart();
       
       // Check if we need to switch buffers
-      if (requiredChunkStart != getActiveBufferChunkStart()) {
-        if (!trySwitchToBufferWithChunk(requiredChunkStart)) {
+      if (requiredChunkStart != activeChunkStart) {
+        std::cout << "Buffer switch needed: current=" << activeChunkStart 
+                  << ", required=" << requiredChunkStart << ", frame=" << currentFrame << std::endl;
+        // Try to switch to buffer containing required chunk
+        if (trySwitchToBufferWithChunk(requiredChunkStart)) {
+          // Successfully switched - use new buffer with correct offset
+          uint64_t localFrame = currentFrame - requiredChunkStart;
+          auto& activeBuf = getActiveBuffer();
+          
+          std::cout << "Using switched buffer: localFrame=" << localFrame 
+                    << ", bufferSize=" << activeBuf.size() 
+                    << ", channels=" << numChannels << std::endl;
+          
+          // Bounds check
+          if (localFrame + numFrames <= activeBuf.size() / numChannels && localFrame >= 0) {
+            frames = &activeBuf[localFrame * numChannels];
+            std::cout << "Using buffer data at offset " << (localFrame * numChannels) << std::endl;
+          } else {
+            // Buffer doesn't have enough data - fallback
+            std::cout << "Buffer bounds check failed: localFrame=" << localFrame 
+                      << ", numFrames=" << numFrames 
+                      << ", bufferFrames=" << (activeBuf.size() / numChannels) << std::endl;
+            performDirectRead(requiredChunkStart, numFrames);
+            frames = buffer.data();
+          }
+        } else {
           // No buffer ready - fallback to direct read
-          std::cout << "Warning: Buffer miss at frame " << frameCounter.load() 
-                    << ", using direct read" << std::endl;
+          std::cout << "No buffer ready, using direct read" << std::endl;
           performDirectRead(requiredChunkStart, numFrames);
           frames = buffer.data();
-        } else {
-          // Successfully switched buffers
-          frames = &getActiveBuffer()[(frameCounter.load() - requiredChunkStart) * numChannels];
         }
       } else {
         // Use current active buffer
-        frames = &getActiveBuffer()[(frameCounter.load() - requiredChunkStart) * numChannels];
+        uint64_t localFrame = currentFrame - activeChunkStart;
+        auto& activeBuf = getActiveBuffer();
+        
+        // Bounds check
+        if (localFrame + numFrames <= activeBuf.size() / numChannels && localFrame >= 0) {
+          frames = &activeBuf[localFrame * numChannels];
+        } else {
+          // Buffer doesn't have enough data - fallback
+          std::cout << "Current buffer bounds check failed: localFrame=" << localFrame 
+                    << ", numFrames=" << numFrames 
+                    << ", bufferFrames=" << (activeBuf.size() / numChannels) << std::endl;
+          performDirectRead(requiredChunkStart, numFrames);
+          frames = buffer.data();
+        }
       }
     } else {
       // For non-streaming, read directly from file

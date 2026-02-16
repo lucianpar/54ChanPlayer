@@ -11,7 +11,7 @@ struct app : App {
   adm_player adm_player_instance;
   app() {
     adm_player_instance.toggleGUI(true); // disable GUI
-    adm_player_instance.setSourceAudioFolder("adm-allo-player/sourceAudio/");
+    adm_player_instance.setSourceAudioFolder("../adm-allo-player/sourceAudio/");
   }
   void onInit() override {
     adm_player_instance.onInit();

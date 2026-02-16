@@ -2,14 +2,25 @@
 
 A multichannel audio playback system for the Allosphere, built with [allolib](https://github.com/AlloSphere-Research-Group/allolib).
 
-## Overview
+## Features
 
-This application plays back 54-channel audio files and maps them to the Allosphere's speaker array. It includes:
+- **Large File Support**: Streaming playback for files up to 2.5GB+ without loading into memory
+- **Double Buffering**: Seamless audio playback with background pre-loading
+- **Real-time File Switching**: Change audio files during playback
+- **54-Channel Mapping**: Optimized for Allosphere speaker layout
+- **Real-time Meters**: dB level monitoring for all channels
+- **GUI Controls**: Full playback control with ImGui interface
 
-- **Runtime file selection** - switch audio files from the GUI dropdown
-- Real-time dB meters for all 54 channels
-- GUI controls for playback, pause, loop, and gain
-- Channel remapping to match the Allosphere speaker layout
+## Streaming Implementation
+
+For large audio files, the player uses an advanced **double buffering streaming system**:
+
+- **Memory Efficient**: Only loads 2 chunks (~6MB) instead of entire file (2.5GB+)
+- **Seamless Playback**: Background thread pre-loads audio chunks
+- **Thread Safe**: Mutex-protected I/O with atomic buffer coordination
+- **Reliable**: Graceful fallback to direct reading prevents dropouts
+
+See [`streamingWAV.md`](streamingWAV.md) for detailed implementation documentation.
 
 ## Speaker Layout
 
@@ -28,8 +39,9 @@ The Allosphere has **54 speakers** arranged in three rings:
 
 | File                 | Description                                    |
 | -------------------- | ---------------------------------------------- |
-| `mainplayer.cpp`     | Main application with GUI and audio playback   |
+| `mainplayer.hpp`     | Main application with GUI and audio playback   |
 | `channelMapping.hpp` | Channel mapping configuration (file → speaker) |
+| `streamingWAV.md`    | Streaming implementation documentation         |
 | `CMakeLists.txt`     | CMake build configuration                      |
 | `sourceAudio/`       | Directory for audio files                      |
 

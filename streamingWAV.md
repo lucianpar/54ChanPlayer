@@ -18,7 +18,7 @@ This document describes the **double buffering streaming WAV audio playback impl
 The implementation uses **double buffering with AlloLib's threading model** for seamless audio streaming:
 
 1. **Double Buffering**: Two pre-allocated buffers alternate between playing and loading
-2. **Background Loading**: Separate thread loads chunks asynchronously 
+2. **Background Loading**: Separate thread loads chunks asynchronously
 3. **AlloLib Coordination**: `animate()` monitors progress and triggers loading
 4. **Audio Thread Safety**: `onSound()` only reads buffers, never allocates or I/O
 5. **Graceful Fallback**: Direct reading prevents dropouts if buffers miss
@@ -38,9 +38,30 @@ std::atomic<int> activeBufferIndex;            // Currently playing buffer
 
 #### 2. Threading Model
 
-- **Graphics Thread (`animate()`)**: Monitors playback progress (75% through chunk), requests next chunk loading
-- **Background Thread**: Loads chunks into inactive buffers asynchronously  
+- **Graphics Thread (`animate()`)**: Monitors playback progress (50% through chunk), requests next chunk loading
+- **Background Thread**: Loads chunks into inactive buffers asynchronously using block reads
 - **Audio Thread (`onSound()`)**: Reads from active buffer, switches buffers atomically
+- **Thread Safety**: Mutex protects SoundFile access, atomic operations for state coordination
+
+#### Thread Safety Implementation
+
+```cpp
+std::mutex soundFileMutex;  // Protects SoundFile operations
+
+// In background loading:
+{
+    std::lock_guard<std::mutex> lock(soundFileMutex);
+    soundFile.seek(chunkStart, SEEK_SET);
+    // Read operations...
+}
+
+// In direct read fallback:
+{
+    std::lock_guard<std::mutex> lock(soundFileMutex);
+    soundFile.seek(startFrame, SEEK_SET);
+    framesRead = soundFile.read(buffer.data(), actualFrames);
+}
+```
 
 #### 3. Buffer Alternation Process
 
@@ -67,15 +88,32 @@ void loadChunkIntoBuffer(uint64_t chunkStart, std::vector<float>& targetBuffer,
     uint64_t actualChunkSize = getChunkSize(chunkStart);
     targetBuffer.resize(actualChunkSize * numChannels);
     
-    soundFile.seek(chunkStart, SEEK_SET);
-    soundFile.read(&targetBuffer[0], actualChunkSize);
+    uint64_t framesRead = 0;
+    {
+        std::lock_guard<std::mutex> lock(soundFileMutex);  // Thread-safe access
+        soundFile.seek(chunkStart, SEEK_SET);
+        
+        uint64_t readBlockSize = 512;  // Read in audio buffer-sized blocks
+        while (framesRead < actualChunkSize) {
+            uint64_t framesToRead = std::min(actualChunkSize - framesRead, readBlockSize);
+            soundFile.read(&targetBuffer[framesRead * numChannels], framesToRead);
+            uint64_t actuallyRead = soundFile.frames();
+            framesRead += actuallyRead;
+            if (actuallyRead < framesToRead) break;  // End of file
+        }
+    }
     
-    chunkStartVar.store(chunkStart);
-    state.store(READY);
+    // Fill remaining with silence
+    std::fill(targetBuffer.begin() + framesRead * numChannels, targetBuffer.end(), 0.0f);
+    
+    if (framesRead == actualChunkSize) {
+        chunkStartVar.store(chunkStart);
+        state.store(READY);
+    } else {
+        state.store(EMPTY);  // Mark as failed if not fully loaded
+    }
 }
-```
-
-#### 6. Playback Logic (`onSound()`)
+```#### 6. Playback Logic (`onSound()`)
 
 - Checks if buffer switch needed: `if (requiredChunkStart != getActiveBufferChunkStart())`
 - Attempts atomic buffer switch: `trySwitchToBufferWithChunk(requiredChunkStart)`
@@ -86,24 +124,37 @@ void loadChunkIntoBuffer(uint64_t chunkStart, std::vector<float>& targetBuffer,
 
 ```cpp
 void onAnimate(double dt) {
-    float progress = (float)(frameCounter % chunkSize) / chunkSize;
+    uint64_t currentFrame = frameCounter.load();
+    uint64_t currentChunk = (currentFrame / chunkSize) * chunkSize;
+    float progressThroughChunk = (float)(currentFrame % chunkSize) / chunkSize;
     
-    if (progress > 0.75f) {  // At 75% through chunk
+    // Trigger loading at 50% through current chunk (earlier for reliability)
+    if (progressThroughChunk > 0.5f) {
         uint64_t nextChunk = getNextChunkStart(currentChunk);
-        requestLoadIntoInactiveBuffer(nextChunk);
+        if (nextChunk != UINT64_MAX) {
+            requestLoadIntoInactiveBuffer(nextChunk);
+        }
+    }
+    
+    // Also trigger loading for the chunk after next
+    if (progressThroughChunk > 0.25f) {
+        uint64_t nextNextChunk = getNextChunkStart(getNextChunkStart(currentChunk));
+        if (nextNextChunk != UINT64_MAX) {
+            requestLoadIntoInactiveBuffer(nextNextChunk);
+        }
     }
 }
 ```
 
 ## API Differences: Single Buffer vs Double Buffering
 
-| Operation   | Single Buffer Streaming       | Double Buffering                |
-| ----------- | ----------------------------- | --------------------------------- |
-| Memory      | 1 chunk (~3MB)               | 2 chunks (~6MB)                  |
-| Threading   | Audio thread blocks on I/O   | Background thread handles I/O    |
-| Reliability | Dropouts between chunks      | Seamless playback                |
-| Complexity  | Simple                       | Thread-safe coordination         |
-| Fallback    | Direct read on miss          | Direct read on buffer miss       |
+| Operation   | Single Buffer Streaming    | Double Buffering              |
+| ----------- | -------------------------- | ----------------------------- |
+| Memory      | 1 chunk (~2.88MB)          | 2 chunks (~5.76MB)            |
+| Threading   | Audio thread blocks on I/O | Background thread handles I/O |
+| Reliability | Dropouts between chunks    | Seamless playback             |
+| Complexity  | Simple                     | Thread-safe coordination      |
+| Fallback    | Direct read on miss        | Direct read on buffer miss    |
 
 ## Memory Usage Comparison
 
@@ -116,9 +167,9 @@ void onAnimate(double dt) {
 ### After (Gamma - Streaming)
 
 - **Chunk Size**: 1 minute = 2.88MB (56ch × 60s × 48kHz × 4 bytes)
-- **Peak Memory**: ~3MB active + GUI overhead
-- **Loading**: Near-instantaneous file open
-- **Streaming**: Background pre-loading with seamless buffer switching
+- **Peak Memory**: ~6MB active working set (2 chunks) + GUI overhead
+- **Loading**: Near-instantaneous file open + first chunk load
+- **Streaming**: Background pre-loading with block-based I/O and seamless buffer switching
 
 ## Performance Characteristics
 
@@ -134,9 +185,11 @@ void onAnimate(double dt) {
 
 ### Disk I/O
 
-- **Pattern**: Proactive background loading + seamless buffer switching
+- **Pattern**: Proactive background loading with block-based reads + seamless buffer switching
+- **Block Size**: 512 frames per read operation for optimal audio buffer alignment
 - **Frequency**: Pre-loaded before needed, no I/O during playback
-- **Overhead**: Background thread handles I/O asynchronously
+- **Thread Safety**: Mutex-protected SoundFile access prevents race conditions
+- **Overhead**: Background thread handles I/O asynchronously with error checking
 
 ### CPU Usage
 
@@ -152,10 +205,10 @@ void onAnimate(double dt) {
 
 ### Chunk Size Configuration
 
-The chunk size is currently fixed at 1 minute but can be adjusted:
+The chunk size is currently fixed at ~2.88 million frames (1 minute at 48kHz) but can be adjusted:
 
 ```cpp
-uint64_t chunkSize = 60 * 48000;  // 1 minute at 48kHz
+uint64_t chunkSize = 60 * 48000;  // 2.88M frames = 1 minute at 48kHz
 ```
 
 **Recommended chunk sizes:**
@@ -164,7 +217,7 @@ uint64_t chunkSize = 60 * 48000;  // 1 minute at 48kHz
 - **Medium**: `60 * 48000` (1 minute, ~2.88MB for 56ch) - _current_
 - **Large**: `300 * 48000` (5 minutes, ~14.4MB for 56ch)
 
-Larger chunks reduce I/O frequency but increase memory usage.
+Larger chunks reduce I/O frequency but increase memory usage and loading time.
 
 ## Error Handling
 
@@ -178,8 +231,10 @@ Larger chunks reduce I/O frequency but increase memory usage.
 
 - Boundary checking prevents out-of-bounds access
 - File end detection with loop handling
-- Failed loads marked buffer as EMPTY
+- Failed loads marked buffer as EMPTY (only fully loaded buffers marked READY)
 - Automatic retry on next animate() cycle
+- Block-based reading with silence filling for partial reads
+- Thread-safe SoundFile access prevents corruption
 
 ### Buffer Miss Handling
 
@@ -216,9 +271,12 @@ Larger chunks reduce I/O frequency but increase memory usage.
 ### Implemented Features ✓
 
 1. **Double Buffering**: ✅ Two-buffer alternation prevents audio dropouts
-2. **Pre-buffering**: ✅ Background loading during playback
+2. **Pre-buffering**: ✅ Background loading during playback with early triggering (50%)
 3. **Multi-threading**: ✅ Separate loader thread for I/O operations
-4. **Thread-safe Coordination**: ✅ Atomic operations and AlloLib threading
+4. **Thread-safe Coordination**: ✅ Atomic operations, mutex-protected SoundFile access
+5. **Block-based I/O**: ✅ 512-frame block reads for reliability
+6. **Error Checking**: ✅ Full read validation before marking buffers ready
+7. **Graceful Fallback**: ✅ Direct reading prevents dropouts with thread safety
 
 ### Potential Future Improvements
 
@@ -227,7 +285,7 @@ Larger chunks reduce I/O frequency but increase memory usage.
 3. **Memory-mapped Files**: OS-level virtual memory management
 4. **Compressed Streaming**: On-the-fly decompression
 5. **Network Streaming**: Remote file access
-4. **Format Support**: Extend beyond WAV/AIFF
+6. **Format Support**: Extend beyond WAV/AIFF
 
 ### Alternative Approaches
 
