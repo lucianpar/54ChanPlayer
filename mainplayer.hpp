@@ -9,8 +9,10 @@ Includes real-time dB meters for all 54 channels.
 */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iostream>
+#include <thread>
 #include <vector>
 #include "al/app/al_App.hpp"
 #include "al/io/al_File.hpp"
@@ -20,9 +22,12 @@ Includes real-time dB meters for all 54 channels.
 
 using namespace al;
 
+// Buffer states for double buffering system
+enum BufferState { EMPTY, LOADING, READY, PLAYING };
+
 struct adm_player {
   gam::SoundFile soundFile;
-  uint64_t frameCounter = 0;
+  std::atomic<uint64_t> frameCounter = {0};
   std::vector<float> buffer;
 
   // Playback controls
@@ -31,6 +36,20 @@ struct adm_player {
   float gain = 0.5f;
   bool streamingMode = true;  // Enable streaming for large files
   uint64_t chunkSize = 60 * 48000;  // 1 minute chunks at 48kHz
+  
+  // Double buffering system
+  std::vector<float> bufferA, bufferB;
+  std::atomic<BufferState> stateA, stateB;
+  std::atomic<uint64_t> chunkStartA, chunkStartB;
+  std::atomic<int> activeBufferIndex;  // 0 = A, 1 = B
+  
+  // Background loading thread
+  std::thread loaderThread;
+  std::atomic<bool> loaderRunning;
+  std::atomic<uint64_t> loadRequestChunk;
+  std::atomic<bool> loadRequested;
+  
+  // Legacy streaming variables (for backward compatibility)
   std::vector<float> audioData;  // Chunked audio data
   uint64_t currentChunkStart = 0;
   uint64_t currentChunkFrames = 0;
@@ -124,10 +143,19 @@ struct adm_player {
                 << numChannels << " channels." << std::endl;
     }
 
-    // For streaming mode, load first chunk
+    // For streaming mode, load first chunk and initialize double buffering
     if (streamingMode) {
-      loadAudioChunk(0);
-      std::cout << "  Streaming mode enabled - loaded first chunk" << std::endl;
+      // Invalidate all buffers when loading new file
+      stateA.store(EMPTY);
+      stateB.store(EMPTY);
+      activeBufferIndex.store(-1);
+      
+      // Load first chunk into buffer A synchronously
+      loadChunkIntoBuffer(0, bufferA, stateA, chunkStartA);
+      activeBufferIndex.store(0);
+      stateA.store(PLAYING);
+      
+      std::cout << "  Streaming mode enabled - loaded first chunk into double buffer" << std::endl;
     }
     // note: we don't store a single filename string; selection is tracked by audioFiles[selectedFileIndex]
 
@@ -137,7 +165,7 @@ struct adm_player {
     }
 
     // Reset playback position
-    frameCounter = 0;
+    frameCounter.store(0);
 
     // Resize buffers for new channel count
     int framesPerBuffer = 512;
@@ -180,6 +208,171 @@ struct adm_player {
               << " (" << chunkFrames << " frames)" << std::endl;
   }
 
+  // Double buffering methods
+  void initializeDoubleBuffering() {
+    // Pre-allocate buffers
+    bufferA.reserve(chunkSize * numChannels);
+    bufferB.reserve(chunkSize * numChannels);
+    
+    // Initialize states
+    stateA.store(EMPTY);
+    stateB.store(EMPTY);
+    activeBufferIndex.store(-1);  // No active buffer initially
+    
+    // Start loader thread
+    loaderRunning.store(true);
+    loaderThread = std::thread([this]() { loaderWorker(); });
+  }
+  
+  void cleanupDoubleBuffering() {
+    loaderRunning.store(false);
+    if (loaderThread.joinable()) {
+      loaderThread.join();
+    }
+  }
+  
+  void loaderWorker() {
+    while (loaderRunning.load()) {
+      if (loadRequested.load()) {
+        loadRequested.store(false);
+        uint64_t chunkToLoad = loadRequestChunk.load();
+        loadChunkIntoInactiveBuffer(chunkToLoad);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  
+  void loadChunkIntoInactiveBuffer(uint64_t chunkStart) {
+    // Find an empty buffer to load into
+    if (stateA.load() == EMPTY) {
+      loadChunkIntoBuffer(chunkStart, bufferA, stateA, chunkStartA);
+    } else if (stateB.load() == EMPTY) {
+      loadChunkIntoBuffer(chunkStart, bufferB, stateB, chunkStartB);
+    } else {
+      // Both buffers busy - evict the non-playing one
+      if (activeBufferIndex.load() == 0) {
+        loadChunkIntoBuffer(chunkStart, bufferB, stateB, chunkStartB);
+      } else {
+        loadChunkIntoBuffer(chunkStart, bufferA, stateA, chunkStartA);
+      }
+    }
+  }
+  
+  void loadChunkIntoBuffer(uint64_t chunkStart, std::vector<float>& targetBuffer, 
+                          std::atomic<BufferState>& state, std::atomic<uint64_t>& chunkStartVar) {
+    state.store(LOADING);
+    
+    try {
+      uint64_t actualChunkSize = getChunkSize(chunkStart);
+      targetBuffer.resize(actualChunkSize * numChannels);
+      
+      soundFile.seek(chunkStart, SEEK_SET);
+      int framesRead = soundFile.read(&targetBuffer[0], actualChunkSize);
+      
+      if (framesRead == (int)actualChunkSize) {
+        chunkStartVar.store(chunkStart);
+        state.store(READY);
+        std::cout << "Loaded chunk: frames " << chunkStart << " to " << (chunkStart + actualChunkSize - 1)
+                  << " (" << actualChunkSize << " frames) into buffer" << std::endl;
+      } else {
+        state.store(EMPTY);
+        std::cerr << "Warning: Failed to load chunk at " << chunkStart << std::endl;
+      }
+    } catch (const std::exception& e) {
+      state.store(EMPTY);
+      std::cerr << "Error loading chunk: " << e.what() << std::endl;
+    }
+  }
+  
+  uint64_t getChunkSize(uint64_t chunkStart) {
+    uint64_t remaining = soundFile.frames() - chunkStart;
+    return std::min(chunkSize, remaining);
+  }
+  
+  uint64_t getNextChunkStart(uint64_t currentChunkStart) {
+    uint64_t nextStart = currentChunkStart + chunkSize;
+    
+    if (nextStart >= soundFile.frames()) {
+      if (loop) {
+        return 0;  // Loop back to beginning
+      } else {
+        return UINT64_MAX;  // No more chunks
+      }
+    }
+    return nextStart;
+  }
+  
+  void requestLoadIntoInactiveBuffer(uint64_t chunkStart) {
+    // Only request if not already loaded/requested
+    if (!isChunkLoadedInAnyBuffer(chunkStart)) {
+      loadRequestChunk.store(chunkStart);
+      loadRequested.store(true);
+    }
+  }
+  
+  bool isChunkLoadedInAnyBuffer(uint64_t chunkStart) {
+    return (stateA.load() == READY && chunkStartA.load() == chunkStart) ||
+           (stateB.load() == READY && chunkStartB.load() == chunkStart);
+  }
+  
+  bool trySwitchToBufferWithChunk(uint64_t chunkStart) {
+    if (stateA.load() == READY && chunkStartA.load() == chunkStart) {
+      activeBufferIndex.store(0);
+      stateA.store(PLAYING);
+      if (activeBufferIndex.load() == 1) stateB.store(EMPTY);  // Mark old buffer as empty
+      return true;
+    } else if (stateB.load() == READY && chunkStartB.load() == chunkStart) {
+      activeBufferIndex.store(1);
+      stateB.store(PLAYING);
+      if (activeBufferIndex.load() == 0) stateA.store(EMPTY);  // Mark old buffer as empty
+      return true;
+    }
+    return false;
+  }
+  
+  std::vector<float>& getActiveBuffer() {
+    return (activeBufferIndex.load() == 0) ? bufferA : bufferB;
+  }
+  
+  uint64_t getActiveBufferChunkStart() {
+    if (activeBufferIndex.load() == 0) {
+      return chunkStartA.load();
+    } else if (activeBufferIndex.load() == 1) {
+      return chunkStartB.load();
+    }
+    return 0;
+  }
+  
+  void performDirectRead(uint64_t chunkStart, uint64_t numFrames) {
+    // Temporary direct read (slower but prevents dropout)
+    soundFile.seek(chunkStart, SEEK_SET);
+    soundFile.read(buffer.data(), numFrames);
+  }
+
+  void onAnimate(double dt) {
+    if (!soundFile.opened() || !streamingMode) return;
+    
+    uint64_t currentFrame = frameCounter.load();
+    uint64_t currentChunk = (currentFrame / chunkSize) * chunkSize;
+    float progressThroughChunk = (float)(currentFrame % chunkSize) / chunkSize;
+    
+    // Trigger loading at 75% through current chunk
+    if (progressThroughChunk > 0.75f) {
+      uint64_t nextChunk = getNextChunkStart(currentChunk);
+      if (nextChunk != UINT64_MAX) {
+        requestLoadIntoInactiveBuffer(nextChunk);
+      }
+    }
+    
+    // Also trigger loading for the chunk after next (if we have time)
+    if (progressThroughChunk > 0.25f) {
+      uint64_t nextNextChunk = getNextChunkStart(getNextChunkStart(currentChunk));
+      if (nextNextChunk != UINT64_MAX) {
+        requestLoadIntoInactiveBuffer(nextNextChunk);
+      }
+    }
+  }
+
   void onInit()  {
     std::cout << "\n=== 54-Channel Audio Player ===" << std::endl;
     std::cout << "Current path: " << al::File::currentPath() << std::endl;
@@ -211,7 +404,10 @@ struct adm_player {
     channelLevels.resize(expectedChannels, 0.0f);
     channelPeaks.resize(expectedChannels, 0.0f);
     peakHoldCounters.resize(expectedChannels, 0);
-    frameCounter = 0;
+    frameCounter.store(0);
+    
+    // Initialize double buffering system
+    initializeDoubleBuffering();
   }
 
   void onCreate() {
@@ -270,9 +466,9 @@ struct adm_player {
 
     ImGui::Separator();
     ImGui::Text("Playback:");
-    ImGui::Text("  Current Frame: %llu / %llu", frameCounter, (uint64_t)soundFile.frames());
+    ImGui::Text("  Current Frame: %llu / %llu", frameCounter.load(), (uint64_t)soundFile.frames());
     ImGui::Text("  Current Time: %.2f / %.2f seconds",
-                (double)frameCounter / soundFile.frameRate(),
+                (double)frameCounter.load() / soundFile.frameRate(),
                 (double)soundFile.frames() / soundFile.frameRate());
 
     ImGui::Separator();
@@ -285,12 +481,12 @@ struct adm_player {
     ImGui::SameLine();
     if (ImGui::Button("⏹ Stop")) {
       playing = false;
-      frameCounter = 0;
+      frameCounter.store(0);
     }
 
     ImGui::SameLine();
     if (ImGui::Button("⏮ Rewind")) {
-      frameCounter = 0;
+      frameCounter.store(0);
     }
 
     if (ImGui::Checkbox("Loop", &loop)) {
@@ -417,9 +613,9 @@ struct adm_player {
     }
 
     // Check if we're at the end
-    if (frameCounter >= soundFile.frames()) {
+    if (frameCounter.load() >= soundFile.frames()) {
       if (loop) {
-        frameCounter = 0;
+        frameCounter.store(0);
       } else {
         playing = false;
         while (io()) {
@@ -432,26 +628,34 @@ struct adm_player {
     }
 
     // Adjust numFrames if we're near the end
-    if (frameCounter + numFrames > soundFile.frames()) {
-      numFrames = soundFile.frames() - frameCounter;
+    if (frameCounter.load() + numFrames > soundFile.frames()) {
+      numFrames = soundFile.frames() - frameCounter.load();
     }
 
-    // Check if we need to load a new chunk
+    // Double buffering logic
+    float* frames = nullptr;
     if (streamingMode) {
-      uint64_t requiredChunkStart = (frameCounter / chunkSize) * chunkSize;
-      if (requiredChunkStart != currentChunkStart) {
-        loadAudioChunk(requiredChunkStart);
+      uint64_t requiredChunkStart = (frameCounter.load() / chunkSize) * chunkSize;
+      
+      // Check if we need to switch buffers
+      if (requiredChunkStart != getActiveBufferChunkStart()) {
+        if (!trySwitchToBufferWithChunk(requiredChunkStart)) {
+          // No buffer ready - fallback to direct read
+          std::cout << "Warning: Buffer miss at frame " << frameCounter.load() 
+                    << ", using direct read" << std::endl;
+          performDirectRead(requiredChunkStart, numFrames);
+          frames = buffer.data();
+        } else {
+          // Successfully switched buffers
+          frames = &getActiveBuffer()[(frameCounter.load() - requiredChunkStart) * numChannels];
+        }
+      } else {
+        // Use current active buffer
+        frames = &getActiveBuffer()[(frameCounter.load() - requiredChunkStart) * numChannels];
       }
-    }
-
-    // Get pointer to current frame
-    float* frames;
-    if (streamingMode) {
-      uint64_t localFrame = frameCounter - currentChunkStart;
-      frames = &audioData[localFrame * numChannels];
     } else {
       // For non-streaming, read directly from file
-      soundFile.seek(frameCounter, SEEK_SET);
+      soundFile.seek(frameCounter.load(), SEEK_SET);
       soundFile.read(buffer.data(), numFrames);
       frames = buffer.data();
     }
@@ -521,7 +725,7 @@ struct adm_player {
       }
     }
 
-    frameCounter += numFrames;
+    frameCounter.fetch_add(numFrames);
   }
 
   bool onKeyDown(const Keyboard& k) {
@@ -534,7 +738,7 @@ struct adm_player {
     }
     // Rewind
     if (k.key() == 'r' || k.key() == 'R') {
-      frameCounter = 0;
+      frameCounter.store(0);
       std::cout << "⏮ Rewound to beginning" << std::endl;
       //return true;
     }
@@ -572,6 +776,7 @@ struct adm_player {
 
   void onExit() {
     if (displayGUI) imguiShutdown();
+    cleanupDoubleBuffering();
   }
 };
 
